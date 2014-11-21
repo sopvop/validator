@@ -34,6 +34,8 @@ data PathElem = PathKey Text
               | PathIndex Int
               deriving (Eq, Ord, Show, Typeable)
 
+type JsonPath = [PathElem]
+
 data LookupResult a = LookupResult a
                     | NotFound
                     | NotArray
@@ -44,14 +46,15 @@ instance ToJSON PathElem where
   toJSON (PathKey t) = toJSON t
   toJSON (PathIndex i) = toJSON i
 
-toJsonPath (x:xs) = LT.toStrict . LB.toLazyText $ mconcat (toFirst x:map fromPath xs)
+renderJsonPath :: JsonPath -> Text
+renderJsonPath (x:xs) = LT.toStrict . LB.toLazyText $ mconcat (toFirst x:map fromPath xs)
   where
     toFirst (PathKey t) = LB.fromText t
     toFirst (PathIndex i) = fromIdx i
     fromPath (PathKey t) = LB.singleton '.' <> LB.fromText t
     fromPath (PathIndex i) = fromIdx i
     fromIdx i = LB.singleton '[' <> LB.decimal i <> LB.singleton ']'
-toJsonPath _ = ""
+renderJsonPath _ = ""
 
 data JsonError err = JsonError err
                    | JsonParsingError String
@@ -60,7 +63,7 @@ data JsonError err = JsonError err
                    | JsonMissing
                    deriving (Eq,Ord,Show,Typeable, Functor)
 
-newtype JsonValidator m err a = JsonValidator (InputValidator [PathElem]
+newtype JsonValidator m err a = JsonValidator (InputValidator JsonPath
                                                 (LookupResult Value) m (JsonError err) a)
         deriving (Functor, Applicative)
 
@@ -83,7 +86,7 @@ justNotFound (LookupResult r) = Right (Just r)
 justNotFound NotArray = Left JsonIsNotArray
 justNotFound NotObject = Left JsonIsNotObject
 
-path :: (FromJSON a, Applicative m) => [PathElem] -> JsonValidator m err a
+path :: (FromJSON a, Applicative m) => JsonPath -> JsonValidator m err a
 path p = JsonValidator $ V.item p `V.prove` (proveLookup >=> proveFromJSON)
 
 field :: (FromJSON a, Applicative m) => Text -> JsonValidator m err a
@@ -112,17 +115,17 @@ jsonLookup (Array arr) (PathIndex i:ps) =
 jsonLookup _ (PathIndex _:_) = NotArray
 
 
-validateJson :: [PathElem] -- root path
+validateJson :: JsonPath -- root path
              -> Value -- input value
              -> JsonValidator m t a -- Validator
-             -> m (Validator [([PathElem], JsonError t)] a)
+             -> m (Validator [(JsonPath, JsonError t)] a)
 validateJson root inp (JsonValidator validator) = unValidator validator (jsonLookup inp) root
 
 validateJsonEither :: Monad m =>
-                   [PathElem]
+                   JsonPath
                    -> Value
                    -> JsonValidator m t b
-                   -> m (Either [([PathElem], JsonError t)] b)
+                   -> m (Either [(JsonPath, JsonError t)] b)
 validateJsonEither root inp val = do
   r <- validateJson root inp val
   return $ case r of
@@ -171,5 +174,5 @@ test = object [ "hui" .= (1::Int)
               , "arr" .= [object [ "elems" .= (2::Int)] ]
               ]
 
-runT inp test = liftM (first (fmap (first toJsonPath))) $ validateJson [PathKey "root"] inp test
+runT inp test = liftM (first (fmap (first renderJsonPath))) $ validateJson [PathKey "root"] inp test
 -}
