@@ -86,8 +86,18 @@ justNotFound (LookupResult r) = Right (Just r)
 justNotFound NotArray = Left JsonIsNotArray
 justNotFound NotObject = Left JsonIsNotObject
 
+mapLabels f = first (fmap (first f))
+
+prependPath :: Functor m => JsonPath -> JsonValidator m err a -> JsonValidator m err a
+prependPath p (JsonValidator (InputValidator m)) = JsonValidator . InputValidator $ \i k ->
+    mapLabels (p++) <$> (m i k)
+
+prepend :: Functor m => PathElem -> JsonValidator m err a -> JsonValidator m err a
+prepend p (JsonValidator (InputValidator m)) = JsonValidator . InputValidator $ \i k ->
+    mapLabels (p:) <$> (m i k)
+
 path :: (FromJSON a, Applicative m) => JsonPath -> JsonValidator m err a
-path p = JsonValidator $ V.item p `V.prove` (proveLookup >=> proveFromJSON)
+path p = prependPath p . JsonValidator $  V.item p `V.prove` (proveLookup >=> proveFromJSON)
 
 field :: (FromJSON a, Applicative m) => Text -> JsonValidator m err a
 field key = path [PathKey key]
@@ -115,28 +125,27 @@ jsonLookup (Array arr) (PathIndex i:ps) =
 jsonLookup _ (PathIndex _:_) = NotArray
 
 
-validateJson :: JsonPath -- root path
+validateJson :: Functor m =>
+             JsonPath -- root path
              -> Value -- input value
              -> JsonValidator m t a -- Validator
              -> m (Validator [(JsonPath, JsonError t)] a)
-validateJson root inp (JsonValidator validator) = unValidator validator (jsonLookup inp) root
+validateJson root inp (JsonValidator validator) = (first . map $ first (root++)) <$> res
+  where
+    res = unValidator validator (jsonLookup inp) []
 
-validateJsonEither :: Monad m =>
+validateJsonEither :: Functor m =>
                    JsonPath
                    -> Value
                    -> JsonValidator m t b
                    -> m (Either [(JsonPath, JsonError t)] b)
-validateJsonEither root inp val = do
-  r <- validateJson root inp val
-  return $ case r of
-    Invalid e -> Left e
-    Valid v -> Right v
+validateJsonEither root inp val = V.validatorToEither <$> validateJson root inp val
 
-fieldObject :: Monad m => Text -> JsonValidator m err a -> JsonValidator m err a
+fieldObject :: (Functor m, Monad m) => Text -> JsonValidator m err a -> JsonValidator m err a
 fieldObject key validator = JsonValidator . InputValidator $ \i k -> do
     case proveLookup $ i [path] of
-      Left e -> return $ Invalid [(path:k, e)]
-      Right v -> validateJson (path:k) v validator
+      Left e -> return $ Invalid [(k ++[path], e)]
+      Right v -> validateJson (k++[path]) v validator
   where
     path = PathKey key
 
@@ -144,6 +153,7 @@ fieldArray key validator = JsonValidator . InputValidator $ \i k -> do
     case proveLookup $ i [path] of
       Left e -> return $ Invalid [(k ++ [path], e)]
       Right (Array v) -> liftM sequenceA . traverse (go k) $ zip [(0 :: Int)..] (toList v)
+      Right r -> return $ Invalid [(k ++ [path], JsonIsNotArray)]
   where
     go root (i, val) = validateJson (root ++ [path, PathIndex i]) val validator
     path = PathKey key
@@ -162,10 +172,17 @@ transformM :: (Functor m, Monad m) =>
            JsonValidator m err a -> (a -> m b) -> JsonValidator m err b
 transformM (JsonValidator m) f = JsonValidator $ V.transformM m f
 
-{-
-testq :: JsonValidator IO String (Int, [Int])
-testq = (,) <$> ( fieldObject "sub" $ field "hui" `prove` checkOne)
-            <*> ( fieldArray "arr" $ (field "elems" `prove` checkOne))
+transform :: (Functor m, Monad m) =>
+          JsonValidator m err a -> (a -> b) -> JsonValidator m err b
+transform m f = transformM m (return .  f)
+
+check :: (b -> Bool) -> a -> b -> Either a b
+check f err = (\v -> if f v then Right v else Left err)
+
+testq :: JsonValidator IO String (Int, [Int], Int)
+testq = (,,) <$> ( fieldObject "sub" $ field "hui" `prove` check (== 2) "Fuck" )
+             <*> ( fieldArray "arr" $ (field "elems" `prove` checkOne))
+             <*> field "hii" `prove` check (==1) "baz"
 
 checkOne i = if i == 1 then Right i else Left "nope"
 
@@ -175,4 +192,3 @@ test = object [ "hui" .= (1::Int)
               ]
 
 runT inp test = liftM (first (fmap (first renderJsonPath))) $ validateJson [PathKey "root"] inp test
--}

@@ -1,10 +1,12 @@
 {-# LANGUAGE DeriveDataTypeable    #-}
+{-# LANGUAGE KindSignatures        #-}
 {-# LANGUAGE MultiParamTypeClasses #-}
 
 module Validator.Types
        where
 
 import Control.Applicative
+import Control.Monad (liftM)
 import Data.Bifunctor
 import Control.Monad.Trans.State.Strict (StateT(..))
 
@@ -39,6 +41,14 @@ instance Bifunctor Validator where
       Invalid e -> Invalid (f e)
 
 type Input key a = key -> a
+
+validatorToEither :: Validator a b -> Either a b
+validatorToEither (Invalid e) = Left e
+validatorToEither (Valid v) = Right v
+
+eitherValid :: key -> Either err a -> Validator [(key, err)] a
+eitherValid key (Left e) = Invalid [(key, e)]
+eitherValid _ (Right r) = Valid r
 
 -- | Validator for key-value input
 newtype InputValidator key input m err a = InputValidator
@@ -89,10 +99,7 @@ proveM (InputValidator mv) f = InputValidator $ \i key -> do
     case v of
       Invalid e -> return $ Invalid e
       Valid val -> do
-         r <- f val
-         return $ case r of
-           Left err -> Invalid [(key, err)]
-           Right r -> Valid r
+         liftM (eitherValid key) $ f val
 
 -- | Purely prove input
 prove :: Functor m => InputValidator key input m err a
