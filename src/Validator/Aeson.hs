@@ -1,37 +1,36 @@
 {-# LANGUAGE DeriveDataTypeable         #-}
 {-# LANGUAGE DeriveFunctor              #-}
 {-# LANGUAGE FlexibleContexts           #-}
+{-# LANGUAGE FlexibleInstances          #-}
 {-# LANGUAGE GeneralizedNewtypeDeriving #-}
+{-# LANGUAGE MultiParamTypeClasses      #-}
 {-# LANGUAGE OverloadedStrings          #-}
 
 module Validator.Aeson
        where
 
-import Control.Applicative
-import Data.Traversable (sequenceA, traverse)
-import Control.Monad (join, liftM, (>=>))
-import Control.Monad.State.Class
-import Control.Monad.Trans
-
-import Data.Bifunctor
-import Data.Typeable
-import Data.Maybe (fromMaybe)
-import Data.Text (Text)
-import Data.Monoid
-import Data.Vector ((!?), toList)
-
-import qualified Data.Text as Text
-import qualified Data.Text.Lazy as LT
-import qualified Data.Text.Lazy.Builder as LB
-import qualified Data.Text.Lazy.Builder.Int as LB
+import           Control.Applicative
+import           Control.Monad.Error.Class        (throwError)
+import           Control.Monad.State.Class
+import           Control.Monad.Trans
+import           Control.Monad.Trans.Except       (ExceptT (..), runExceptT)
+import           Control.Monad.Trans.State.Strict (StateT (..), evalStateT)
+import           Data.Functor.Identity
+import           Data.Monoid
+import           Data.Text                        (Text)
+import qualified Data.Text.Lazy                   as LT
+import qualified Data.Text.Lazy.Builder           as LB
+import qualified Data.Text.Lazy.Builder.Int       as LB
+import           Data.Traversable                 (forM)
+import           Data.Typeable
+import           Data.Vector                      (toList)
 
 
-import Data.Aeson (Value (..), FromJSON(..), (.=), object, ToJSON(..))
-import Data.Aeson.Types (parseEither)
-import qualified Data.HashMap.Strict as HM
+import           Data.Aeson                       (FromJSON (..), ToJSON (..), Value (..))
+import           Data.Aeson.Types                 (parseEither)
+import qualified Data.HashMap.Strict              as HM
 
-import Validator.Types (Result(..), InputValidator(..))
-import qualified Validator.Types as V
+import           Validator.Types
 
 
 data PathElem = PathKey Text
@@ -67,137 +66,90 @@ data JsonError err = JsonError err
                    | JsonMissing
                    deriving (Eq,Ord,Show,Typeable, Functor)
 
-type JsonValidator m err a =  InputValidator JsonPath Value m (JsonError err) a
 
-proveFromJSON :: FromJSON a => Value -> Either (JsonError err) a
-proveFromJSON v = first JsonParsingError $ parseEither parseJSON v
+data JsonState = JsonState
+     { jsonPath  :: !JsonPath
+     , jsonInput :: !(HM.HashMap Text Value)
+     } deriving (Eq, Show, Typeable)
 
-justNotFound NotFound = Right Nothing
-justNotFound (LookupResult r) = Right (Just r)
-justNotFound NotArray = Left JsonIsNotArray
-justNotFound NotObject = Left JsonIsNotObject
-
-mapLabels f = first (fmap (first f))
-
-prependPath :: Functor m => JsonPath -> JsonValidator m err a -> JsonValidator m err a
-prependPath p (InputValidator m) = InputValidator $ \k ->
-    mapLabels (++p) <$> (m k)
-
-prepend :: Functor m => PathElem -> JsonValidator m err a -> JsonValidator m err a
-prepend p (InputValidator m) = InputValidator $ \k ->
-    mapLabels (p:) <$> (m k)
-{-
-jsonLookup v [] = Right v
-jsonLookup (Object hm) (PathKey t:ps) =
-  case HM.lookup t hm of
-      Nothing -> Left JsonMissing
-      Just v -> jsonLookup v ps
-jsonLookup _ (PathKey _:_) = Left JsonIsNotObject
-jsonLookup (Array arr) (PathIndex i:ps) =
-  case arr !? i of
-    Nothing -> Left JsonMissing
-    Just v -> jsonLookup v ps
-jsonLookup _ (PathIndex _:_) = Left JsonIsNotArray
--}
-jsonLookup v [] = LookupResult v
-jsonLookup (Object hm) (PathKey t:ps) =
-  case HM.lookup t hm of
-      Nothing -> NotFound
-      Just v -> jsonLookup v ps
-jsonLookup _ (PathKey _:_) = NotObject
-jsonLookup (Array arr) (PathIndex i:ps) =
-  case arr !? i of
-    Nothing -> NotFound
-    Just v -> jsonLookup v ps
-jsonLookup _ (PathIndex _:_) = NotArray
-
-proveLookup (LookupResult a) = Right a
-proveLookup NotFound = Left JsonMissing
-proveLookup NotArray = Left JsonIsNotArray
-proveLookup NotObject = Left JsonIsNotObject
-
-item :: Monad m => JsonPath -> JsonValidator m err (LookupResult Value)
-item p = InputValidator $ \_ -> gets (Success . flip jsonLookup p)
-
-path :: (FromJSON a, Monad m) => JsonPath -> JsonValidator m err a
-path p = prependPath p $ item p `V.prove` (proveLookup >=> proveFromJSON)
-
-field :: (FromJSON a, Monad m) => Text -> JsonValidator m err a
-field key = path [PathKey key]
-
-fieldOpt :: (FromJSON b, Monad m) => Text -> JsonValidator m err (Maybe b)
-fieldOpt key = item [PathKey key] `V.prove` (justNotFound >=> traverse proveFromJSON)
+type JsonValidator err m a = ValidatorT [(JsonPath, JsonError err)]
+                                        (StateT JsonState m) a
 
 
-fieldDefault :: (FromJSON a, Monad m) => Text -> a -> JsonValidator m err a
-fieldDefault key def =
-   item [PathKey key]
-   `V.prove` (justNotFound >=> traverse proveFromJSON)
-   `V.transform` fromMaybe def
+type JsonProof err m a = ExceptT [(JsonPath,JsonError err)]
+                                 (StateT JsonState m) a
+
+reqField :: (Monad m, FromJSON a) => Text -> JsonProof err m a
+reqField key = do
+   JsonState path hm <- get
+   case HM.lookup key hm of
+      Nothing -> throwError [(path++[PathKey key], JsonMissing)]
+      Just v -> case parseEither parseJSON v of
+        Left e -> throwError [(path++[PathKey key], JsonParsingError e)]
+        Right r -> pure r
+
+optField :: (Monad m, FromJSON a) => Text -> JsonProof err m (Maybe a)
+optField key = do
+   JsonState path hm <- get
+   case HM.lookup key hm of
+      Nothing -> pure Nothing
+      Just v -> case parseEither parseJSON v of
+        Left e -> throwError [(path++[PathKey key], JsonParsingError e)]
+        Right r -> pure r
+
+defField :: (Monad m, FromJSON a) => a -> Text -> JsonProof err m a
+defField def key = do
+   JsonState path hm <- get
+   case HM.lookup key hm of
+      Nothing -> pure def
+      Just v -> case parseEither parseJSON v of
+        Left e -> throwError [(path++[PathKey key], JsonParsingError e)]
+        Right r -> pure r
 
 
-validateJson :: Monad m =>
-             JsonPath -- root path
-             -> Value -- input value
-             -> JsonValidator m t a -- Validator
-             -> m (Result [(JsonPath, JsonError t)] a)
-validateJson root inp validator = res
-  where
-    res = V.evalInputValidator root inp validator
+check :: Monad m => (a -> Bool) -> err -> a -> JsonProof err m a
+check f msg v = do
+ path <- gets jsonPath
+ case f v of
+   False -> throwError [(path, JsonError msg)]
+   True -> return v
 
-validateJsonEither :: Monad m =>
-                   JsonPath
-                   -> Value
-                   -> JsonValidator m t b
-                   -> m (Either [(JsonPath, JsonError t)] b)
-validateJsonEither root inp val = V.validatorToEither <$> validateJson root inp val
+prove :: Monad m => (t -> Either err b) -> t -> JsonProof err m b
+prove chk v = do
+  path <- gets jsonPath
+  case chk v of
+    Left e -> throwError [(path, JsonError e)]
+    Right r -> pure r
 
-fieldObject :: (Functor m, Monad m) => Text -> JsonValidator m err a -> JsonValidator m err a
-fieldObject key (InputValidator validator) = field key `V.validate`
-            (InputValidator $ \p -> validator (p <> [PathKey key]))
+proveJson :: Monad m
+          => JsonPath
+          -> HM.HashMap Text Value
+          -> JsonProof e m a
+          -> m (Either [(JsonPath, JsonError e)] a)
+proveJson p hm act = evalStateT (runExceptT act) (JsonState p hm)
 
-fieldArray :: (Monad m, FromJSON a) => Text -> JsonValidator m err a -> JsonValidator m err [a]
-fieldArray key validator = InputValidator $ \k -> do
-    st <- get
-    res <- V.evalInputValidator k st (field key)
-    let path = k <> [PathKey key]
-    case res of
-      Failure e -> return $ Failure e
-      Success r -> lift $ fmap sequenceA $ traverse (go path) $ zip [(0::Int)..] (toList r)
-  where
-    go k (i, val) = V.evalInputValidator (k <> [PathIndex i]) val validator
+fieldObject :: Monad m => Text -> JsonProof err m a -> JsonProof err m a
+fieldObject key proof = do
+  v <- reqField key
+  JsonState p _ <- get
+  case v of
+    Object hm -> ExceptT $ do
+      lift $ evalStateT (runExceptT proof) $ JsonState (PathKey key : p) hm
+    _ -> throwError [(p ++ [PathKey key], JsonIsNotObject)]
 
-prove :: Functor m => JsonValidator m err a
-      -> (a -> Either err b) -> JsonValidator m err b
-prove m f = V.prove m (first JsonError . f)
+fieldArray :: Monad m => Text -> JsonProof err m a -> JsonProof err m [a]
+fieldArray key proof = do
+  arr <- reqField key
+  JsonState p _ <- get
+  let elems = zip [(0::Int)..] (toList arr)
+  forM elems $ \(i, val) ->
+      ExceptT . lift $ proveJson (p <> [PathIndex i]) val proof
 
-proveM :: (Functor m, Monad m) =>
-       JsonValidator m err a
-       -> (a -> m (Either err b))
-       -> JsonValidator m err b
-proveM m f = V.proveM m (fmap (first JsonError) . f)
-
-transformM :: (Functor m, Monad m) =>
-           JsonValidator m err a -> (a -> m b) -> JsonValidator m err b
-transformM m f = V.transformM m f
-
-transform :: (Functor m, Monad m) =>
-          JsonValidator m err a -> (a -> b) -> JsonValidator m err b
-transform m f = transformM m (return .  f)
-
-check :: (b -> Bool) -> a -> b -> Either a b
-check f err = (\v -> if f v then Right v else Left err)
-
-testq :: JsonValidator IO String (Int, [Int], Int)
-testq = (,,) <$> ( fieldObject "sub" $ field "hui" `prove` check (== 2) "Fuck" )
-             <*> ( fieldArray "arr" $ (field "elems" `prove` checkOne))
-             <*> field "hii" `prove` check (==1) "baz"
-
-checkOne i = if i == 1 then Right i else Left "nope"
-
-test = object [ "hui" .= (1::Int)
-              , "sub" .= object [ "hui" .= (1::Int), "bar" .= ("baz" ::Text)]
-              , "arr" .= [object [ "elems" .= (2::Int)] ]
-              ]
-
-runT inp test = liftM (first (fmap (first renderJsonPath))) $ validateJson [PathKey "root"] inp test
+validateJson :: Monad m
+              => JsonPath
+              -> JsonProof e m a
+              -> Value
+              -> m (Either [(JsonPath, JsonError e)] a)
+validateJson p proof val = case val of
+  Object hm -> proveJson p hm proof
+  _ -> pure $ Left [([], JsonIsNotObject)]
