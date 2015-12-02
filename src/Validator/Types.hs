@@ -1,10 +1,4 @@
-{-# LANGUAGE DeriveDataTypeable         #-}
-{-# LANGUAGE DeriveFunctor              #-}
-{-# LANGUAGE FlexibleInstances          #-}
-{-# LANGUAGE FunctionalDependencies     #-}
-{-# LANGUAGE GeneralizedNewtypeDeriving #-}
-{-# LANGUAGE KindSignatures             #-}
-{-# LANGUAGE MultiParamTypeClasses      #-}
+{-# LANGUAGE DeriveDataTypeable #-}
 
 module Validator.Types
        where
@@ -12,6 +6,8 @@ module Validator.Types
 import           Control.Applicative
 import           Control.Monad.Trans.Except (ExceptT (..))
 import           Data.Bifunctor
+import           Data.Monoid
+import           Data.Traversable           (traverse)
 import           Data.Typeable              (Typeable)
 
 -- | Either like data type, but with applicative instance accumulating
@@ -31,6 +27,11 @@ instance Monoid err => Applicative (Result err) where
   Failure a <*> _ = Failure a
   _ <*> Failure b = Failure b
 
+instance Monoid err => Alternative (Result err) where
+  empty = Failure mempty
+  Success a <|> _ = Success a
+  Failure _ <|> b = b
+
 instance Bifunctor Result where
   second = fmap
   first f v = case v of
@@ -42,8 +43,9 @@ instance Bifunctor Result where
 
 
 newtype ValidatorT err m a = ValidatorT { runValidatorT :: m (Result err a) }
-        deriving (Functor)
 
+instance Monad m => Functor (ValidatorT err m) where
+  fmap f (ValidatorT m) = ValidatorT ( fmap f <$> m )
 
 instance (Monad m, Monoid err) => Applicative (ValidatorT err m) where
   pure = ValidatorT . pure . Success
@@ -52,6 +54,12 @@ instance (Monad m, Monoid err) => Applicative (ValidatorT err m) where
      a <- ma
      pure $ f <*> a
 
+instance (Monad m, Monoid err) => Alternative (ValidatorT err m) where
+  empty = ValidatorT (pure empty)
+  ValidatorT ma <|> ValidatorT mb = ValidatorT $ do
+    a <- ma
+    b <- mb
+    return $ a <|> b
 
 eitherToResult :: Either err a -> Result err a
 eitherToResult (Left e) = Failure e
