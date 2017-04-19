@@ -2,7 +2,7 @@
 -- documentation, see http://haskell.org/cabal/users-guide/
 
 name:                validator
-version:             0.3.0.0
+version:             0.3.0.1
 synopsis:            Library for validation user input
 -- description:
 license:             BSD3
@@ -20,7 +20,7 @@ library
                        Validator.Aeson
   -- other-modules:
   -- other-extensions:
-  build-depends:       aeson                      >= 0.6   && < 0.12
+  build-depends:       aeson                      >= 0.6   && < 1.2
                      , base                       >= 4.7   && < 4.10
                      , bifunctors                 >= 4.0   && < 6
                      , mtl                        >= 2.2   && < 2.3
